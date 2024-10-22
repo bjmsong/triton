@@ -63,6 +63,7 @@ def _layer_norm_fwd_fused(
     # Compute mean
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    # compute #BLOCK_SIZE data in one loop
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
@@ -126,7 +127,11 @@ def _layer_norm_fwd_fused(
 # In Stage 2, the buffers are further reduced to compute the final :math:`\nabla_{w}` and :math:`\nabla_{b}`.
 # In the following implementation, Stage 1 is implemented by the function :code:`_layer_norm_bwd_dx_fused` and Stage 2 is implemented by the function :code:`_layer_norm_bwd_dwdb`.
 
-
+"""
+each block compute: 
+    - one row of DX
+    - one row of DW, DB , then accumulates partial
+"""
 @triton.jit
 def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
                              DY,  # pointer to the output gradient
@@ -148,7 +153,7 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
     DY += row * stride
     DX += row * stride
     # Offset locks and weights/biases gradient pointer for parallel reduction
-    lock_id = row % GROUP_SIZE_M
+    lock_id = row % GROUP_SIZE_M  # belong to which group [0, GROUP_SIZE_M)
     Lock += lock_id
     Count = Lock + GROUP_SIZE_M
     DW = DW + lock_id * N + cols
@@ -160,12 +165,12 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
     mean = tl.load(Mean + row)
     rstd = tl.load(Rstd + row)
     # Compute dx
-    xhat = (x - mean) * rstd
-    wdy = w * dy
-    xhat = tl.where(mask, xhat, 0.)
+    wdy = w * dy   # term 1
     wdy = tl.where(mask, wdy, 0.)
-    c1 = tl.sum(xhat * wdy, axis=0) / N
-    c2 = tl.sum(wdy, axis=0) / N
+    xhat = (x - mean) * rstd
+    xhat = tl.where(mask, xhat, 0.)
+    c1 = tl.sum(xhat * wdy, axis=0) / N  # term 2
+    c2 = tl.sum(wdy, axis=0) / N  # term 3
     dx = (wdy - (xhat * c1 + c2)) * rstd
     # Write dx
     tl.store(DX + cols, dx, mask=mask)
@@ -186,7 +191,7 @@ def _layer_norm_bwd_dx_fused(DX,  # pointer to the input gradient
     # Release the lock
     tl.atomic_xchg(Lock, 0)
 
-
+# reduction
 @triton.jit
 def _layer_norm_bwd_dwdb(DW,  # pointer to the partial sum of weights gradient
                          DB,  # pointer to the partial sum of biases gradient
@@ -235,7 +240,8 @@ class LayerNorm(torch.autograd.Function):
         mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
         rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
         # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x.element_size()
+        # 64KB: registers size per block
+        MAX_FUSED_SIZE = 65536 // x.element_size()      
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
         if N > BLOCK_SIZE:
             raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
@@ -246,7 +252,7 @@ class LayerNorm(torch.autograd.Function):
             x_arg, y, weight, bias, mean, rstd,  #
             x_arg.stride(0), N, eps,  #
             BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
-        ctx.save_for_backward(x, weight, bias, mean, rstd)
+        ctx.save_for_backward(x, weight, bias, mean, rstd)  # these tensors will be used in backward
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.eps = eps
@@ -286,14 +292,14 @@ class LayerNorm(torch.autograd.Function):
             BLOCK_SIZE_N=128, num_ctas=1)
         return dx, None, dw, db, None
 
-
+# forward()
 layer_norm = LayerNorm.apply
 
 
 def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     # create data
     x_shape = (M, N)
-    w_shape = (x_shape[-1], )
+    w_shape = (x_shape[-1], ) # (N, )
     weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
     bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
